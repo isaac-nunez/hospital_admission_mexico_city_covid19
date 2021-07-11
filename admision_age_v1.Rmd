@@ -1,0 +1,268 @@
+---
+title: "Edad de admisión covid-19"
+output:
+  word_document: default
+  html_notebook: default
+---
+
+El objetivo de este trabajo es ver quien se intuba, quien no se intuba, quien se muere sin intubarse y cuáles son los factores asociados a estos desenlaces. 
+La hipótesis es que las personas mayores se intuban menos, se mueren más y que la saturación del hospital en particular al que acuden determina si cualquiera recibe tubo o no.
+
+```{r needed packages and saved dataframes, include = F}
+library(tidyverse);library(data.table);library(lubridate); library(zoo); library(patchwork);library(survival)
+
+#load("base_cdmx_v1.RDa")
+Sys.setlocale("LC_ALL", locale= "English")
+```
+
+Base de Ciudad de México. Aquí lo importante es obtener quienes fueron intubadxs y en donde, además de si fallecieron o no.
+```{r definición de caso CDMX, include = F, run = T, echo = F, warnings= F}
+base_cdmx_v1 <- fread("E:/Protocolos de investigación/CDMX/Actas de defunción/sisver_cdmx_27_04_2021_actualizacion_16_04.csv")[,                                                                                                                               fec_defuncion := ymd(fecdef)][, resultado_final := if_else(antigencovid == "POSITIVO" | resdefin == "SARS-CoV-2", T, F)]
+
+#Data for selection flowchart
+table(base_cdmx_v1$tipacien)
+patients_included_1 <- filter(base_cdmx_v1, tipacien == "HOSPITALIZADO")
+
+#MEDIANA de tiempo con síntomas al momento de la muerte en pacientes que se murieron sin tubo
+
+mediana_sint_muerte <- filter(patients_included_1, intubado == "NO" & !is.na(fec_defuncion)) %>% 
+  mutate(mediana_s_m = as.numeric(fec_defuncion - ymd(fecinisi))) %>% 
+  summarise(mediana = median(mediana_s_m))
+#11 días
+
+
+mediana_ingreso_muerte <- filter(patients_included_1, intubado == "NO" & !is.na(fec_defuncion)) %>% 
+  mutate(mediana_i_m = as.numeric(fec_defuncion - ymd(fecingre))) %>% 
+  summarise(mediana = median(mediana_i_m))
+#5 días
+
+mediana_sintomas_ingreso <- filter(patients_included_1, intubado == "NO" & !is.na(fec_defuncion)) %>% 
+  mutate(mediana_i_m = as.numeric(ymd(fecingre) - ymd(fecinisi))) %>% 
+  summarise(mediana = median(mediana_i_m))
+#5 días
+
+
+hosp_vivieron <- filter(patients_included_1, is.na(fec_defuncion)) %>%
+  mutate(fecinisi=ymd(fecinisi),
+         lugarmuerte = NA,
+         fecingre = ymd(fecingre)) %>% 
+  select(fecinisi, fecingre, fec_defuncion, sexo, edad,lugarmuerte) 
+  
+```
+
+Base de actas de defunción. Aquí lo importante es determinar si las fechas son iguales a las que se reportan en la base de covid de la SISVER y si las defunciones fueron o no fueron en casa.
+```{r actas, include = F, warning = F}
+base_actas_v1 <- fread("E:/Protocolos de investigación/CDMX/Defunciones corte 15 de marzo 2021/defunciones_corte15marzo.csv")[, sexo := if_else(sexo == "Mujer", "FEMENINO", "MASCULINO")][,
+  fec_defuncion := ymd(fec_defuncion)
+][,tipacien := if_else(lugarmuerte == "Hospital", "HOSPITALIZADO", "AMBULATORIO")][causa != "Otra",][, entresi := estado][,mpioresi:=alcaldia][,`:=`(fecinisi=fec_defuncion-11,
+                                                                                                                                                     fecingre=fec_defuncion-5)][,
+                                                                                                                                                                                        .(fecinisi, fecingre, fec_defuncion,
+                                                                                                                                                                      sexo,edad,lugarmuerte)] 
+```
+
+
+```{r base de trabajo, include = F}
+
+base_trabajo <- rbind(filter(hosp_vivieron, fecinisi <= "2021-02-15"),base_actas_v1) %>% 
+  filter(fec_defuncion >="18-03-2020"|is.na(fec_defuncion)) %>% 
+  filter(fecinisi>="2020-03-07") %>% 
+  mutate(muerte = if_else(!is.na(fec_defuncion), T, F),
+         semana_epi = if_else(year(fecinisi)== 2020, week(fecinisi),week(fecinisi)+53))
+
+range(base_trabajo$fecinisi)
+#Base para número de casos por día
+base_cdmx_v2 <- base_cdmx_v1 %>% 
+  mutate(fecinisi=ymd(fecinisi)) %>% 
+  filter((fec_defuncion >="2020-03-18"|is.na(fec_defuncion)) &
+           fecinisi <="2021-02-15") %>% 
+  filter(fecinisi>="2020-03-07") %>% 
+  group_by(fecinisi) %>% 
+  count() %>% 
+  rename(daily_cases = n)
+
+
+base_final <- base_trabajo %>% 
+  left_join(base_cdmx_v2, by = "fecinisi") %>% 
+  mutate(hospitalizado = case_when(is.na(lugarmuerte)~T,
+                                   lugarmuerte=="Hospital"~T,
+                                   lugarmuerte=="Domicilio"~F))
+```
+
+
+```{r  log regression hospitalization and death as outcomes, include = F, warning= F}
+set.seed(12345)
+
+ind <- sample(c(0,1), nrow(base_final), replace = T, prob= c(0.7, 0.3))
+
+train <- base_final[ind==1,]
+test <- base_final[ind==2,]
+
+
+
+#EDAD DESENLACE HOSPITALIZACIÓN
+
+mymodel_edad <- glm(hospitalizado ~ rcs(edad, 3)+semana_epi+rcs(daily_cases, 3)+sexo, 
+                          data = train, family = 'binomial')
+summary(mymodel_edad)
+exp(coef(mymodel_edad))
+exp(coef(mymodel_edad)-(1.96*0.003))
+exp(coef(mymodel_edad)+(1.96*0.003))
+
+lr_edad <- termplot(mymodel_edad, se=TRUE, plot = F)$edad
+center_edad <- with(lr_edad, y[x==50])
+ci_edad <- lr_edad$y + outer(lr_edad$se, c(0, -1.96, 1.96), '*')
+
+edad_df <- data.frame(edad = lr_edad$x, 
+                     y = lr_edad$y,
+                     se = lr_edad$se,
+                     lower_ci = ci_edad[,2],
+                     upper_ci = ci_edad[,3],
+                     mean_ci = ci_edad[,1])
+
+
+edad_ors <- edad_df[with(edad_df, edad == 20 | edad == 30 | edad == 40 | 
+                         edad == 50 |edad== 60|edad== 70|edad== 80),] %>% 
+  mutate(or = round(exp(y-center_edad),2),
+         lower_or = round(exp(lower_ci-center_edad),2),
+         upper_or = round(exp(upper_ci-center_edad),2),
+         full_or = str_c(round(exp(y-center_edad),2), " (", round(exp(lower_ci-center_edad),2),
+                         "-", round(exp(upper_ci-center_edad),2),")"))
+
+
+#EDAD DESENLACE MUERTE
+mymodel_edad_m <- glm(muerte ~ rcs(edad, 3)+semana_epi+rcs(daily_cases, 3)+sexo, 
+                          data = train, family = 'binomial')
+summary(mymodel_edad_m)
+exp(coef(mymodel_edad_m))
+exp(coef(mymodel_edad_m)-(1.96*0.002))
+exp(coef(mymodel_edad_m)+(1.96*0.002))
+
+lr_edad_m <- termplot(mymodel_edad_m, se=TRUE, plot = F)$edad
+center_edad_m <- with(lr_edad_m, y[x==50])
+ci_edad_m <- lr_edad_m$y + outer(lr_edad_m$se, c(0, -1.96, 1.96), '*')
+
+edad_df_m <- data.frame(edad = lr_edad_m$x, 
+                     y = lr_edad_m$y,
+                     se = lr_edad_m$se,
+                     lower_ci = ci_edad_m[,2],
+                     upper_ci = ci_edad_m[,3],
+                     mean_ci = ci_edad_m[,1])
+
+
+edad_ors_m <- edad_df_m[with(edad_df_m, edad == 20 | edad == 30 | edad == 40 | 
+                         edad == 50 |edad== 60|edad== 70|edad== 80),] %>% 
+  mutate(or = round(exp(y-center_edad_m),2),
+         lower_or = round(exp(lower_ci-center_edad_m),2),
+         upper_or = round(exp(upper_ci-center_edad_m),2),
+         full_or = str_c(round(exp(y-center_edad_m),2), " (", round(exp(lower_ci-center_edad_m),2),
+                         "-", round(exp(upper_ci-center_edad_m),2),")"))
+```
+
+```{r spline plots, include = F}
+age_spline_plot <- ggplot(edad_df, aes(x = edad, 
+                                                        y = exp(y - center_edad))) +
+  geom_hline(yintercept = seq(from = 0.5, to = 5, by = .5), colour = "lightgray") +
+  geom_hline(yintercept=1, colour = "black", size = .7)+
+  geom_smooth(se = F, colour = "black", size = 1.2) +
+  geom_smooth(se = F, colour = "black", linetype = "dashed", 
+              aes(y = exp(upper_ci - center_edad)), size = .8) +
+  geom_smooth(se = F, colour = "black", linetype = "dashed", 
+              aes(y = exp(lower_ci - center_edad)), size = .8) +
+  ylab("OR of hospitalization") +
+  xlab("Age")+
+  theme_light()+
+  theme(axis.text.x = element_text(size = 14, face = "bold", colour="black"),
+        axis.title.x = element_text(face = "bold", size = 14),
+        axis.ticks = element_line(size = 1, colour = "black"),
+        axis.title.y = element_text(face = "bold", size = 14),
+        axis.text.y = element_text(size = 14, face = "bold", colour = "black"),
+        plot.title = element_text(size = 14, face = "bold"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black"))+
+  scale_y_continuous(limits = c(0, 4))+
+  scale_x_continuous(breaks = seq(20,80,10),
+                     limits = c(20, 80))
+
+```
+
+```{r texto del artículo, include = F}
+fivenum(base_final$edad, na.rm = T)
+table(base_final$sexo)
+table(base_final$sexo)/nrow(base_final)
+
+table(SEXO=base_final$sexo,
+      MUERTE=base_final$muerte)
+
+22134/(13128+22134)
+41371/(16745+41371)
+
+range(base_final$daily_cases)
+
+table(MUERTES=base_final$muerte,
+      LUGAR=base_final$hospitalizado)
+range(base_final$daily_cases)
+```
+
+
+```{r  log regression hospitalization and death as outcomes2, include = F, warning= F, run = F}
+#CASOS DIARIOS DESENLACE HOSPITALIZACIÓN
+
+mymodel_edad <- glm(hospitalizado ~ rcs(edad, 3)+semana_epi+rcs(daily_cases, 3)+sexo, 
+                          data = train, family = 'binomial')
+summary(mymodel_edad)
+exp(coef(mymodel_edad))
+exp(coef(mymodel_edad)-(1.96*0.003))
+exp(coef(mymodel_edad)+(1.96*0.003))
+
+lr_edad <- termplot(mymodel_edad, se=TRUE, plot = F)$edad
+center_edad <- with(lr_edad, y[x==50])
+ci_edad <- lr_edad$y + outer(lr_edad$se, c(0, -1.96, 1.96), '*')
+
+edad_df <- data.frame(edad = lr_edad$x, 
+                     y = lr_edad$y,
+                     se = lr_edad$se,
+                     lower_ci = ci_edad[,2],
+                     upper_ci = ci_edad[,3],
+                     mean_ci = ci_edad[,1])
+
+
+edad_ors <- edad_df[with(edad_df, edad == 20 | edad == 30 | edad == 40 | 
+                         edad == 50 |edad== 60|edad== 70|edad== 80),] %>% 
+  mutate(or = round(exp(y-center_edad),2),
+         lower_or = round(exp(lower_ci-center_edad),2),
+         upper_or = round(exp(upper_ci-center_edad),2),
+         full_or = str_c(round(exp(y-center_edad),2), " (", round(exp(lower_ci-center_edad),2),
+                         "-", round(exp(upper_ci-center_edad),2),")"))
+
+
+#CASOS DIARIOS DESENLACE MUERTE
+mymodel_edad_m <- glm(muerte ~ rcs(edad, 3)+semana_epi+rcs(daily_cases, 3)+sexo, 
+                          data = train, family = 'binomial')
+summary(mymodel_edad_m)
+exp(coef(mymodel_edad_m))
+exp(coef(mymodel_edad_m)-(1.96*0.002))
+exp(coef(mymodel_edad_m)+(1.96*0.002))
+
+lr_edad_m <- termplot(mymodel_edad_m, se=TRUE, plot = F)$edad
+center_edad_m <- with(lr_edad_m, y[x==50])
+ci_edad_m <- lr_edad_m$y + outer(lr_edad_m$se, c(0, -1.96, 1.96), '*')
+
+edad_df_m <- data.frame(edad = lr_edad_m$x, 
+                     y = lr_edad_m$y,
+                     se = lr_edad_m$se,
+                     lower_ci = ci_edad_m[,2],
+                     upper_ci = ci_edad_m[,3],
+                     mean_ci = ci_edad_m[,1])
+
+
+edad_ors_m <- edad_df_m[with(edad_df_m, edad == 20 | edad == 30 | edad == 40 | 
+                         edad == 50 |edad== 60|edad== 70|edad== 80),] %>% 
+  mutate(or = round(exp(y-center_edad_m),2),
+         lower_or = round(exp(lower_ci-center_edad_m),2),
+         upper_or = round(exp(upper_ci-center_edad_m),2),
+         full_or = str_c(round(exp(y-center_edad_m),2), " (", round(exp(lower_ci-center_edad_m),2),
+                         "-", round(exp(upper_ci-center_edad_m),2),")"))
+
+```
